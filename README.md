@@ -16,8 +16,9 @@ the picture.
 
 > ⚠️ **Status:** v0.1, early but working. macOS-focused. JPEG and PNG today; see the roadmap below.
 
-<!-- Add a screenshot at docs/screenshot.png and it'll render here -->
-<!-- ![Scrub](docs/screenshot.png) -->
+![Scrub detecting the hidden IPTC and Adobe XMP metadata embedded in a PNG](docs/screenshot.png)
+
+<sub><i>Scrub showing the hidden IPTC + XMP metadata inside a PNG — one click strips it, losslessly, into a clean copy.</i></sub>
 
 ## Why it's different: lossless by design
 
