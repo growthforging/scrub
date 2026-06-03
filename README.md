@@ -1,5 +1,8 @@
 # Scrub
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
+
 **Strip hidden metadata from your images — locally, and losslessly.**
 
 Every photo your phone takes carries an invisible passenger: EXIF metadata. That
