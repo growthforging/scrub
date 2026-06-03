@@ -5,14 +5,14 @@
 
 **Strip hidden metadata from your images — locally, and losslessly.**
 
-Every photo your phone takes carries an invisible passenger: EXIF metadata. That
-often includes the **GPS coordinates of exactly where the picture was taken**,
-your device model and serial, the precise timestamp, and editing-software history.
-Share the file and you share all of it.
+Scrub is a tiny macOS app that strips the hidden metadata baked into image files —
+the **GPS coordinates** of where a photo was taken, your device make and model, the
+exact timestamp, and editing history — so you can share pictures without quietly
+handing all of that over.
 
-Scrub is a tiny desktop app that drops that baggage. Drag an image in, see what's
-hidden inside, and remove it with one click — without re-compressing or degrading
-the picture.
+Drag an image in, see exactly what's embedded, then remove it with one click. It works
+**losslessly**: the pixels and color profile come out untouched — no re-compression,
+no quality loss — unlike "export" or screenshot tricks that silently degrade the image.
 
 > ⚠️ **Status:** v0.1, early but working. macOS-focused. JPEG and PNG today; see the roadmap below.
 
