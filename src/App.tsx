@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 import scrubIcon from "./assets/scrub-icon.png";
 
-type ImageFormat = "jpeg" | "png";
+type ImageFormat = "jpeg" | "png" | "webp" | "heic" | "video";
 
 interface MetadataBlock {
   label: string;
@@ -26,6 +26,7 @@ interface Inspection {
   blocks: MetadataBlock[];
   highlights: ExifHighlights;
   hasMetadata: boolean;
+  note: string | null;
 }
 interface FileInspection {
   path: string;
@@ -43,6 +44,7 @@ interface ScrubResult {
   originalBytes: number;
   cleanedBytes: number;
   error: string | null;
+  note: string | null;
 }
 interface Entry {
   path: string;
@@ -56,6 +58,12 @@ function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const VIDEO_EXT = ["MOV", "MP4", "M4V", "QT"];
+function ext(name: string): string {
+  const i = name.lastIndexOf(".");
+  return i >= 0 ? name.slice(i + 1).toUpperCase() : "";
 }
 
 function App() {
@@ -72,12 +80,7 @@ function App() {
       setEntries((prev) => {
         const byPath = new Map(prev.map((e) => [e.path, e]));
         for (const r of results) {
-          byPath.set(r.path, {
-            path: r.path,
-            name: r.name,
-            inspection: r.inspection,
-            error: r.error,
-          });
+          byPath.set(r.path, { path: r.path, name: r.name, inspection: r.inspection, error: r.error });
         }
         return Array.from(byPath.values());
       });
@@ -108,7 +111,9 @@ function App() {
   const browse = useCallback(async () => {
     const selected = await open({
       multiple: true,
-      filters: [{ name: "Images", extensions: ["jpg", "jpeg", "png"] }],
+      filters: [
+        { name: "Media", extensions: ["jpg", "jpeg", "png", "webp", "heic", "heif", "mov", "mp4", "m4v", "qt"] },
+      ],
     });
     if (!selected) return;
     void addPaths(Array.isArray(selected) ? selected : [selected]);
@@ -142,10 +147,11 @@ function App() {
     void invoke("reveal_in_finder", { path }).catch(() => {});
   }, []);
 
-  const totalToRemove = scrubbable.reduce(
-    (sum, e) => sum + (e.inspection?.metadataBytes ?? 0),
-    0
-  );
+  const onMap = useCallback((url: string) => {
+    void invoke("open_url", { url }).catch(() => {});
+  }, []);
+
+  const totalToRemove = scrubbable.reduce((sum, e) => sum + (e.inspection?.metadataBytes ?? 0), 0);
 
   return (
     <main className="app">
@@ -166,8 +172,8 @@ function App() {
 
       <section className={`dropzone ${dragging ? "dragging" : ""} ${entries.length ? "compact" : ""}`}>
         <div className="dropzone-inner">
-          <p className="dz-title">{dragging ? "Drop to add" : "Drop images here"}</p>
-          <p className="dz-sub">JPEG &amp; PNG · or</p>
+          <p className="dz-title">{dragging ? "Drop to add" : "Drop images or a folder here"}</p>
+          <p className="dz-sub">JPEG · PNG · WebP · HEIC · MP4 · MOV · or</p>
           <button className="primary" onClick={browse} disabled={busy}>
             Browse…
           </button>
@@ -176,24 +182,20 @@ function App() {
 
       <section className="list">
         {entries.map((e) => (
-          <FileCard key={e.path} entry={e} onReveal={reveal} />
+          <FileCard key={e.path} entry={e} onReveal={reveal} onMap={onMap} />
         ))}
       </section>
 
       {scrubbable.length > 0 && (
         <footer className="actionbar">
           <label className="overwrite">
-            <input
-              type="checkbox"
-              checked={overwrite}
-              onChange={(ev) => setOverwrite(ev.target.checked)}
-            />
+            <input type="checkbox" checked={overwrite} onChange={(ev) => setOverwrite(ev.target.checked)} />
             Overwrite originals
           </label>
           <span className="spacer" />
           <span className="hint">
-            {scrubbable.length} image{scrubbable.length > 1 ? "s" : ""} ·{" "}
-            {formatBytes(totalToRemove)} of metadata
+            {scrubbable.length} image{scrubbable.length > 1 ? "s" : ""}
+            {totalToRemove > 0 ? ` · ${formatBytes(totalToRemove)} of metadata` : ""}
           </span>
           <button className="primary scrub" onClick={scrub} disabled={busy}>
             {busy ? "Scrubbing…" : overwrite ? "Scrub & overwrite" : "Scrub → copies"}
@@ -204,70 +206,95 @@ function App() {
   );
 }
 
-function FileCard({ entry, onReveal }: { entry: Entry; onReveal: (p: string) => void }) {
+function FileCard({
+  entry,
+  onReveal,
+  onMap,
+}: {
+  entry: Entry;
+  onReveal: (p: string) => void;
+  onMap: (url: string) => void;
+}) {
   const { inspection, error, result } = entry;
   const h = inspection?.highlights;
+  const isVideo = inspection?.format === "video" || VIDEO_EXT.includes(ext(entry.name));
 
   return (
     <div className="card">
-      <div className="card-head">
-        <span className="fname" title={entry.path}>
-          {entry.name}
-        </span>
-        {inspection && (
-          <span className="badge">
-            {inspection.format.toUpperCase()} · {formatBytes(inspection.totalBytes)}
-          </span>
-        )}
-      </div>
-
-      {error && <div className="error">⚠ {error}</div>}
-
-      {inspection && !result && (
-        inspection.hasMetadata ? (
-          <div className="meta">
-            {h?.gps && (
-              <div className="gps">
-                📍 Location embedded: <strong>{h.gps}</strong>
-              </div>
-            )}
-            {(h?.camera || h?.dateTime || h?.software) && (
-              <div className="chips">
-                {h?.camera && <span className="chip">📷 {h.camera}</span>}
-                {h?.dateTime && <span className="chip">🕑 {h.dateTime}</span>}
-                {h?.software && <span className="chip">🛠 {h.software}</span>}
-              </div>
-            )}
-            <div className="blocks">
-              {inspection.blocks.map((b, i) => (
-                <span className="block" key={i}>
-                  {b.label} <em>{formatBytes(b.bytes)}</em>
-                </span>
-              ))}
-            </div>
-          </div>
-        ) : (
-          <div className="clean">✓ No metadata found — already clean.</div>
-        )
+      {isVideo ? (
+        <video className="thumb" src={convertFileSrc(entry.path)} muted preload="metadata" />
+      ) : (
+        <img className="thumb" src={convertFileSrc(entry.path)} alt="" />
       )}
-
-      {result &&
-        (result.error ? (
-          <div className="error">⚠ {result.error}</div>
-        ) : result.outputName ? (
-          <div className="done">
-            <span className="done-line">
-              ✓ Scrubbed · removed {formatBytes(result.bytesRemoved)} → {result.outputName}
+      <div className="card-body">
+        <div className="card-head">
+          <span className="fname" title={entry.path}>
+            {entry.name}
+          </span>
+          {inspection && (
+            <span className="badge">
+              {inspection.format === "video" ? ext(entry.name) : inspection.format.toUpperCase()} ·{" "}
+              {formatBytes(inspection.totalBytes)}
             </span>
-            {result.outputPath && (
-              <button className="ghost sm" onClick={() => onReveal(result.outputPath!)}>
-                Show in Finder
-              </button>
-            )}
-          </div>
-        ) : (
-          <div className="clean">✓ Already clean — nothing to remove.</div>
-        ))}
+          )}
+        </div>
+
+        {error && <div className="error">⚠ {error}</div>}
+
+        {inspection && !result && (
+          inspection.hasMetadata ? (
+            <div className="meta">
+              {h?.gps && (
+                <button
+                  className="gps"
+                  title="Open this location in Maps"
+                  onClick={() => h.gpsMapsUrl && onMap(h.gpsMapsUrl)}
+                >
+                  📍 Location embedded: <strong>{h.gps}</strong>{" "}
+                  <span className="gps-open">— open in Maps ↗</span>
+                </button>
+              )}
+              {(h?.camera || h?.dateTime || h?.software) && (
+                <div className="chips">
+                  {h?.camera && <span className="chip">📷 {h.camera}</span>}
+                  {h?.dateTime && <span className="chip">🕑 {h.dateTime}</span>}
+                  {h?.software && <span className="chip">🛠 {h.software}</span>}
+                </div>
+              )}
+              {inspection.blocks.length > 0 && (
+                <div className="blocks">
+                  {inspection.blocks.map((b, i) => (
+                    <span className="block" key={i}>
+                      {b.label} <em>{formatBytes(b.bytes)}</em>
+                    </span>
+                  ))}
+                </div>
+              )}
+              {inspection.note && <div className="note">{inspection.note}</div>}
+            </div>
+          ) : (
+            <div className="clean">✓ No metadata found — already clean.</div>
+          )
+        )}
+
+        {result &&
+          (result.error ? (
+            <div className="error">⚠ {result.error}</div>
+          ) : result.outputName ? (
+            <div className="done">
+              <span className="done-line">
+                ✓ {result.note ?? `Scrubbed · removed ${formatBytes(result.bytesRemoved)}`} → {result.outputName}
+              </span>
+              {result.outputPath && (
+                <button className="ghost sm" onClick={() => onReveal(result.outputPath!)}>
+                  Show in Finder
+                </button>
+              )}
+            </div>
+          ) : (
+            <div className="clean">✓ Already clean — nothing to remove.</div>
+          ))}
+      </div>
     </div>
   );
 }

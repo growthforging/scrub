@@ -14,7 +14,7 @@ Drag an image in, see exactly what's embedded, then remove it with one click. It
 **losslessly**: the pixels and color profile come out untouched — no re-compression,
 no quality loss — unlike "export" or screenshot tricks that silently degrade the image.
 
-> ⚠️ **Status:** v0.1, early but working. macOS-focused. JPEG and PNG today; see the roadmap below.
+> ⚠️ **Status:** v0.2 — JPEG, PNG, WebP, HEIC, and video. macOS-focused.
 
 ![Scrub detecting the hidden IPTC and Adobe XMP metadata embedded in a PNG](docs/screenshot.png)
 
@@ -32,29 +32,31 @@ copying everything else through byte-for-byte:
 - ✅ Removed: EXIF (incl. GPS), XMP, IPTC, comments, PNG text chunks, timestamps
 - ✅ Kept untouched: the image data and the **ICC color profile** (so colors don't shift)
 
-The pixels you get out are bit-identical to the pixels you put in. No generational loss.
+For **JPEG, PNG and WebP**, the pixels you get out are bit-identical to the pixels you put
+in — no generational loss. **HEIC** can't be edited in place, so it's converted to a clean
+JPEG; **video** (`.mov`/`.mp4`) is remuxed with `ffmpeg` — streams copied, metadata dropped,
+no re-encode.
 
 ## Features
 
-- **Drag & drop** one or many images
-- **See before you strip** — a clear readout of what's embedded, including a
-  📍 GPS warning with the actual coordinates
-- **Lossless removal** — no re-encoding, color profile preserved
-- **Safe by default** — writes a `name-clean.jpg` copy and leaves your original
-  alone (optional "overwrite" toggle)
+- **Drag & drop** images, videos, or a whole **folder** (scanned recursively)
+- **Thumbnails + a clear readout** of what's embedded, including a 📍 **GPS** warning with
+  the real coordinates — click to **open the spot in Maps**
+- **Lossless** for JPEG/PNG/WebP (no re-encode, ICC color profile preserved)
+- **HEIC → clean JPEG**, and **video remuxed** without metadata (`.mov`/`.mp4`)
+- **Safe by default** — writes a `name-clean.*` copy and leaves your original alone
+  (optional "overwrite" toggle)
 - **Reveal in Finder** when done
-- **100% local** — nothing ever leaves your machine. No network, no telemetry,
-  no accounts.
+- **100% local** — nothing leaves your machine. No network, no telemetry, no accounts.
 
 ## Supported formats
 
 | Format | Status |
 | ------ | ------ |
-| JPEG   | ✅ |
-| PNG    | ✅ |
-| WebP   | 🔜 planned |
-| HEIC   | 🔜 planned |
-| TIFF   | 🔜 planned |
+| JPEG · PNG · WebP | ✅ stripped losslessly, in place |
+| HEIC | ✅ converted to a clean JPEG (via macOS `sips`) |
+| `.mov` · `.mp4` · `.m4v` | ✅ remuxed without metadata (needs `ffmpeg`) |
+| TIFF · AVIF | 🔜 planned |
 
 ## Install / run from source
 
@@ -80,9 +82,12 @@ After scrubbing, Scrub reports `removed N KB` and the file shows no metadata.
 You can double-check with standard tools:
 
 ```bash
-# should print little to nothing for the cleaned file
+# images — should print little/nothing for the cleaned file
 exiftool image-clean.jpg
 mdls image-clean.jpg | grep -i gps
+
+# video — the cleaned copy should have no location / creation / device tags
+ffprobe -show_format clip-clean.mov 2>&1 | grep -iE 'location|creation|make|model'
 ```
 
 ## Tech
@@ -90,8 +95,10 @@ mdls image-clean.jpg | grep -i gps
 - [Tauri v2](https://tauri.app) — tiny, fast native shell (Rust)
 - [React](https://react.dev) + TypeScript + [Vite](https://vite.dev) — UI
 - [`kamadak-exif`](https://crates.io/crates/kamadak-exif) — decoding EXIF for the "before" view
-- Hand-written JPEG/PNG container parsing for the lossless strip (`src-tauri/src/strip.rs`),
-  covered by unit tests
+- Hand-written JPEG / PNG / WebP container parsing for the lossless strip
+  (`src-tauri/src/strip.rs`), covered by unit tests
+- macOS `sips` for HEIC conversion, and [`ffmpeg`](https://ffmpeg.org) for video remuxing
+  (`brew install ffmpeg`)
 
 ## License
 

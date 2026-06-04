@@ -1,7 +1,7 @@
 {
   "name": "scrub",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Strip hidden metadata (EXIF/GPS, XMP, IPTC) from images — locally and losslessly. A tiny macOS app built with Tauri + Rust.",
   "license": "MIT",
   "type": "module",

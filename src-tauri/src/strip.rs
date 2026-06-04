@@ -12,6 +12,9 @@ use serde::Serialize;
 pub enum ImageFormat {
     Jpeg,
     Png,
+    Webp,
+    Heic,
+    Video,
 }
 
 /// A single block of metadata that was (or would be) removed.
@@ -44,6 +47,7 @@ pub struct Inspection {
     pub blocks: Vec<MetadataBlock>,
     pub highlights: ExifHighlights,
     pub has_metadata: bool,
+    pub note: Option<String>,
 }
 
 pub fn detect_format(data: &[u8]) -> Option<ImageFormat> {
@@ -52,16 +56,41 @@ pub fn detect_format(data: &[u8]) -> Option<ImageFormat> {
         Some(ImageFormat::Jpeg)
     } else if data.starts_with(&PNG_SIG) {
         Some(ImageFormat::Png)
+    } else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        Some(ImageFormat::Webp)
+    } else if data.len() >= 12 && &data[4..8] == b"ftyp" && is_heic_brand(&data[8..12]) {
+        Some(ImageFormat::Heic)
     } else {
         None
     }
 }
 
+fn is_heic_brand(brand: &[u8]) -> bool {
+    matches!(
+        brand,
+        b"heic" | b"heix" | b"mif1" | b"msf1" | b"heim" | b"heis" | b"hevc" | b"hevx"
+    )
+}
+
 /// Inspect bytes: report format, metadata blocks present, and EXIF highlights.
 pub fn inspect(data: &[u8]) -> Result<Inspection, String> {
     let format = detect_format(data).ok_or_else(|| {
-        "Unsupported file type — Scrub handles JPEG and PNG for now.".to_string()
+        "Unsupported file type — Scrub handles JPEG, PNG, WebP and HEIC.".to_string()
     })?;
+
+    // HEIC can't be stripped in place; it's converted to a clean JPEG when scrubbed.
+    if format == ImageFormat::Heic {
+        return Ok(Inspection {
+            format,
+            total_bytes: data.len(),
+            metadata_bytes: 0,
+            blocks: Vec::new(),
+            highlights: exif_highlights(data),
+            has_metadata: true,
+            note: Some("HEIC — scrubs to a clean JPEG copy".to_string()),
+        });
+    }
+
     let (_, blocks) = walk(format, data)?;
     let metadata_bytes = blocks.iter().map(|b| b.bytes).sum();
     Ok(Inspection {
@@ -71,13 +100,14 @@ pub fn inspect(data: &[u8]) -> Result<Inspection, String> {
         has_metadata: !blocks.is_empty(),
         blocks,
         highlights: exif_highlights(data),
+        note: None,
     })
 }
 
 /// Strip bytes: return cleaned image + the blocks that were removed.
 pub fn strip(data: &[u8]) -> Result<(Vec<u8>, Vec<MetadataBlock>, ImageFormat), String> {
     let format = detect_format(data).ok_or_else(|| {
-        "Unsupported file type — Scrub handles JPEG and PNG for now.".to_string()
+        "Unsupported file type — Scrub handles JPEG, PNG, WebP and HEIC.".to_string()
     })?;
     let (out, blocks) = walk(format, data)?;
     Ok((out, blocks, format))
@@ -87,6 +117,9 @@ fn walk(format: ImageFormat, data: &[u8]) -> Result<(Vec<u8>, Vec<MetadataBlock>
     match format {
         ImageFormat::Jpeg => strip_jpeg(data),
         ImageFormat::Png => strip_png(data),
+        ImageFormat::Webp => strip_webp(data),
+        ImageFormat::Heic => Err("HEIC is converted to JPEG, not stripped in place.".to_string()),
+        ImageFormat::Video => Err("Video is remuxed with ffmpeg, not stripped in place.".to_string()),
     }
 }
 
@@ -255,6 +288,82 @@ fn png_text_keyword(chunk_data: &[u8]) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(kw).to_string())
+}
+
+// ---------------------------------------------------------------------------
+// WebP (RIFF container)
+// ---------------------------------------------------------------------------
+
+fn strip_webp(data: &[u8]) -> Result<(Vec<u8>, Vec<MetadataBlock>), String> {
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
+        return Err("Not a valid WebP file.".to_string());
+    }
+    let mut removed = Vec::new();
+    let mut kept: Vec<([u8; 4], Vec<u8>)> = Vec::new();
+    let mut vp8x = false;
+    let (mut rm_exif, mut rm_xmp) = (false, false);
+
+    let mut i = 12usize;
+    while i + 8 <= data.len() {
+        let cc = [data[i], data[i + 1], data[i + 2], data[i + 3]];
+        let size = u32::from_le_bytes([data[i + 4], data[i + 5], data[i + 6], data[i + 7]]) as usize;
+        let dstart = i + 8;
+        let dend = dstart + size;
+        if dend > data.len() {
+            break; // truncated
+        }
+        match &cc {
+            b"EXIF" => {
+                removed.push(MetadataBlock { label: "EXIF".to_string(), bytes: 8 + size });
+                rm_exif = true;
+            }
+            b"XMP " => {
+                removed.push(MetadataBlock { label: "XMP".to_string(), bytes: 8 + size });
+                rm_xmp = true;
+            }
+            _ => {
+                if &cc == b"VP8X" {
+                    vp8x = true;
+                }
+                kept.push((cc, data[dstart..dend].to_vec()));
+            }
+        }
+        i = dend + (size & 1); // chunks are padded to an even size
+    }
+
+    if removed.is_empty() {
+        return Ok((data.to_vec(), removed));
+    }
+
+    // Clear the EXIF/XMP presence bits in the VP8X header so decoders don't expect them.
+    if vp8x {
+        for (cc, d) in kept.iter_mut() {
+            if *cc == *b"VP8X" && !d.is_empty() {
+                if rm_exif {
+                    d[0] &= !0x08;
+                }
+                if rm_xmp {
+                    d[0] &= !0x04;
+                }
+            }
+        }
+    }
+
+    let mut payload = Vec::with_capacity(data.len());
+    payload.extend_from_slice(b"WEBP");
+    for (cc, d) in &kept {
+        payload.extend_from_slice(cc);
+        payload.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        payload.extend_from_slice(d);
+        if d.len() & 1 == 1 {
+            payload.push(0); // pad to even
+        }
+    }
+    let mut out = Vec::with_capacity(payload.len() + 8);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&payload);
+    Ok((out, removed))
 }
 
 // ---------------------------------------------------------------------------

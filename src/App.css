@@ -279,3 +279,45 @@ button:disabled {
 .scrub {
   white-space: nowrap;
 }
+
+/* v0.2 — thumbnails, HEIC note, clickable GPS */
+.card {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+.thumb {
+  width: 54px;
+  height: 54px;
+  flex-shrink: 0;
+  border-radius: 9px;
+  object-fit: cover;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+}
+.card-body {
+  flex: 1;
+  min-width: 0;
+}
+.gps {
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.gps:hover {
+  background: rgba(255, 107, 107, 0.2);
+}
+.gps-open {
+  opacity: 0.75;
+  font-size: 11.5px;
+}
+.note {
+  margin-top: 8px;
+  width: fit-content;
+  font-size: 12px;
+  color: var(--accent-2);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  padding: 4px 9px;
+  border-radius: 7px;
+}
