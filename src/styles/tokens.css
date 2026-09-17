@@ -1,0 +1,196 @@
+/* ==========================================================================
+   Scrub — design tokens
+
+   Semantic surface/foreground pairs follow the shadcn/ui convention so the
+   palette stays swappable: a `--x` token is a surface, `--x-fg` is what sits
+   on it. Colours are OKLCH so light and dark can share a hue and differ only
+   in lightness, which keeps the accent from drifting between themes.
+   ========================================================================== */
+
+:root {
+  /* ---- Radius ---------------------------------------------------------- */
+  --r-xs: 5px;
+  --r-sm: 8px;
+  --r-md: 11px;
+  --r-lg: 15px;
+  --r-xl: 20px;
+  --r-full: 999px;
+
+  /* ---- Space — 4px base ------------------------------------------------ */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-7: 28px;
+  --s-8: 32px;
+  --s-10: 40px;
+  --s-12: 48px;
+  --s-16: 64px;
+
+  /* ---- Type ------------------------------------------------------------ */
+  /* System faces only — an app that promises nothing leaves the machine has
+     no business fetching a webfont at runtime. */
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+    system-ui, sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+    "SF Pro Text", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono",
+    Menlo, monospace;
+
+  --t-10: 10px;
+  --t-11: 11px;
+  --t-12: 12px;
+  --t-13: 13px;
+  --t-14: 14px;
+  --t-16: 16px;
+  --t-20: 20px;
+  --t-26: 26px;
+  --t-34: 34px;
+
+  /* ---- Motion ---------------------------------------------------------- */
+  /* One ease for arrivals, one with a little overshoot for things that should
+     feel physical, one symmetric for state that moves both ways. */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.34, 1.35, 0.64, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+
+  --dur-1: 110ms;
+  --dur-2: 170ms;
+  --dur-3: 260ms;
+  --dur-4: 400ms;
+  --dur-5: 560ms;
+
+  --stagger: 34ms;
+
+  /* ---- Layout ---------------------------------------------------------- */
+  --measure: 720px;
+  --titlebar-h: 52px;
+  /* macOS traffic lights live here; content starts after them. */
+  --traffic-lights: 78px;
+}
+
+/* ==========================================================================
+   Dark — the default. Near-black with a faint cool cast, never blue-grey.
+   ========================================================================== */
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --background: oklch(0.148 0.006 274);
+  --foreground: oklch(0.967 0.003 274);
+
+  /* Three surface steps: the page, a card on it, a well recessed into the
+     card. `--well` goes darker than `--card` so an inset panel reads as inset;
+     `--muted` goes lighter, because a chip sits on top of the card. */
+  --card: oklch(0.187 0.007 274);
+  --card-hover: oklch(0.206 0.008 274);
+  --well: oklch(0.163 0.006 274);
+
+  --muted: oklch(0.243 0.008 274);
+  --muted-fg: oklch(0.706 0.013 274);
+  --faint-fg: oklch(0.556 0.014 274);
+
+  --border: oklch(0.272 0.009 274);
+  --border-strong: oklch(0.345 0.012 274);
+  /* A 1px top highlight does the work a drop shadow can't in a dark UI. */
+  --sheen: rgba(255, 255, 255, 0.045);
+
+  /* Brand — sampled from the app icon's gradient (#5E8DFD → #9D85FF). */
+  --brand: oklch(0.665 0.168 267);
+  --brand-2: oklch(0.686 0.167 293);
+  --brand-soft: color-mix(in oklab, var(--brand) 16%, transparent);
+  --brand-line: color-mix(in oklab, var(--brand) 42%, transparent);
+  --ring: oklch(0.70 0.16 272);
+
+  /* Primary action is near-white on near-black: maximum contrast, and it
+     leaves the brand hue free for accents where legibility isn't at stake. */
+  --primary: oklch(0.967 0.003 274);
+  --primary-fg: oklch(0.17 0.006 274);
+  --primary-hover: oklch(1 0 0);
+
+  --danger: oklch(0.694 0.183 21);
+  --danger-fg: oklch(0.83 0.1 21);
+  --danger-soft: color-mix(in oklab, var(--danger) 15%, transparent);
+  --danger-line: color-mix(in oklab, var(--danger) 36%, transparent);
+
+  --warning: oklch(0.812 0.142 78);
+  --warning-fg: oklch(0.86 0.11 78);
+  --warning-soft: color-mix(in oklab, var(--warning) 14%, transparent);
+
+  --success: oklch(0.762 0.148 165);
+  --success-fg: oklch(0.82 0.12 165);
+  --success-soft: color-mix(in oklab, var(--success) 14%, transparent);
+
+  /* Fifth family, used only by metadata blocks that record *when* and *what*
+     rather than *who* or *where*. */
+  --info: oklch(0.745 0.108 232);
+  --info-fg: oklch(0.82 0.085 232);
+  --info-soft: color-mix(in oklab, var(--info) 15%, transparent);
+
+  --scrim: rgba(6, 6, 9, 0.68);
+  --glass: color-mix(in oklab, var(--background) 76%, transparent);
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-2: 0 8px 24px -10px rgba(0, 0, 0, 0.75);
+  --shadow-3: 0 24px 60px -18px rgba(0, 0, 0, 0.85);
+}
+
+/* ==========================================================================
+   Light — warm-neutral paper, not clinical white.
+   ========================================================================== */
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --background: oklch(0.984 0.002 274);
+  --foreground: oklch(0.214 0.011 274);
+
+  --card: oklch(1 0 0);
+  --card-hover: oklch(0.988 0.002 274);
+  --well: oklch(0.968 0.003 274);
+
+  --muted: oklch(0.962 0.004 274);
+  --muted-fg: oklch(0.495 0.014 274);
+  --faint-fg: oklch(0.625 0.013 274);
+
+  --border: oklch(0.912 0.004 274);
+  --border-strong: oklch(0.848 0.007 274);
+  --sheen: rgba(255, 255, 255, 0.9);
+
+  --brand: oklch(0.548 0.203 271);
+  --brand-2: oklch(0.575 0.205 292);
+  --brand-soft: color-mix(in oklab, var(--brand) 10%, transparent);
+  --brand-line: color-mix(in oklab, var(--brand) 32%, transparent);
+  --ring: oklch(0.58 0.19 271);
+
+  --primary: oklch(0.216 0.011 274);
+  --primary-fg: oklch(0.99 0 0);
+  --primary-hover: oklch(0.14 0.008 274);
+
+  --danger: oklch(0.552 0.212 25);
+  --danger-fg: oklch(0.47 0.2 25);
+  --danger-soft: color-mix(in oklab, var(--danger) 9%, transparent);
+  --danger-line: color-mix(in oklab, var(--danger) 30%, transparent);
+
+  --warning: oklch(0.632 0.145 62);
+  --warning-fg: oklch(0.52 0.13 58);
+  --warning-soft: color-mix(in oklab, var(--warning) 12%, transparent);
+
+  --success: oklch(0.552 0.128 163);
+  --success-fg: oklch(0.47 0.12 163);
+  --success-soft: color-mix(in oklab, var(--success) 12%, transparent);
+
+  --info: oklch(0.545 0.125 240);
+  --info-fg: oklch(0.46 0.125 240);
+  --info-soft: color-mix(in oklab, var(--info) 11%, transparent);
+
+  --scrim: rgba(250, 250, 252, 0.7);
+  --glass: color-mix(in oklab, var(--background) 72%, transparent);
+
+  --shadow-1: 0 1px 2px rgba(18, 18, 30, 0.06);
+  --shadow-2: 0 10px 28px -14px rgba(18, 18, 30, 0.22);
+  --shadow-3: 0 28px 64px -22px rgba(18, 18, 30, 0.28);
+}

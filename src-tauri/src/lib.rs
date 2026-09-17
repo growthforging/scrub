@@ -4,6 +4,50 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::{AppHandle, Emitter};
+
+/// Set while a batch is running so the user can stop a long folder job.
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Progress tick for a running batch — one per file, emitted as it completes.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Progress {
+    phase: &'static str,
+    index: usize,
+    total: usize,
+    name: String,
+}
+
+fn tick(app: &AppHandle, phase: &'static str, index: usize, total: usize, name: &str) {
+    let _ = app.emit(
+        "scrub://progress",
+        Progress { phase, index, total, name: name.to_string() },
+    );
+}
+
+/// What the host machine can actually do, so the UI can say so up front
+/// instead of failing halfway through a batch.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Capabilities {
+    ffmpeg: bool,
+    sips: bool,
+}
+
+#[tauri::command]
+fn capabilities() -> Capabilities {
+    Capabilities {
+        ffmpeg: ffmpeg_bin().is_some() && ffprobe_bin().is_some(),
+        sips: Path::new("/usr/bin/sips").is_file(),
+    }
+}
+
+#[tauri::command]
+fn cancel_batch() {
+    CANCELLED.store(true, Ordering::SeqCst);
+}
 
 const MEDIA_EXTS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "heic", "heif", // images
@@ -67,11 +111,17 @@ struct FileInspection {
 }
 
 #[tauri::command]
-fn inspect_files(paths: Vec<String>) -> Vec<FileInspection> {
-    expand_paths(paths)
+fn inspect_files(app: AppHandle, paths: Vec<String>) -> Vec<FileInspection> {
+    CANCELLED.store(false, Ordering::SeqCst);
+    let expanded = expand_paths(paths);
+    let total = expanded.len();
+    expanded
         .into_iter()
-        .map(|p| {
+        .enumerate()
+        .take_while(|_| !CANCELLED.load(Ordering::SeqCst))
+        .map(|(i, p)| {
             let name = file_name(&p);
+            tick(&app, "inspect", i, total, &name);
             let result = if is_video(&p) {
                 inspect_video(&p)
             } else {
@@ -139,7 +189,7 @@ fn collect_tags(json: &Value, tags: &mut BTreeMap<String, String>) {
 
 fn inspect_video(path: &str) -> Result<strip::Inspection, String> {
     let bin = ffprobe_bin()
-        .ok_or_else(|| "ffmpeg not found — run `brew install ffmpeg` to handle video.".to_string())?;
+        .ok_or_else(|| "ffmpeg not found. Run `brew install ffmpeg` to handle video.".to_string())?;
     let out = std::process::Command::new(bin)
         .args(["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams"])
         .arg(path)
@@ -150,6 +200,19 @@ fn inspect_video(path: &str) -> Result<strip::Inspection, String> {
     }
     let json: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
     let total_bytes = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+
+    // First stream that reports a frame size is the video track.
+    let (width, height) = json
+        .get("streams")
+        .and_then(|s| s.as_array())
+        .and_then(|streams| {
+            streams.iter().find_map(|s| {
+                let w = s.get("width")?.as_u64()? as u32;
+                let h = s.get("height")?.as_u64()? as u32;
+                Some((Some(w), Some(h)))
+            })
+        })
+        .unwrap_or((None, None));
 
     let mut tags = BTreeMap::new();
     collect_tags(&json, &mut tags);
@@ -194,7 +257,9 @@ fn inspect_video(path: &str) -> Result<strip::Inspection, String> {
         has_metadata: !tags.is_empty(),
         blocks,
         highlights: h,
-        note: Some("Video — scrubs to a clean copy (lossless remux)".to_string()),
+        note: Some("Video remuxes to a clean copy with no re-encode".to_string()),
+        width,
+        height,
     })
 }
 
@@ -231,11 +296,21 @@ impl ScrubResult {
 }
 
 #[tauri::command]
-fn scrub_files(paths: Vec<String>, overwrite: bool) -> Vec<ScrubResult> {
-    expand_paths(paths)
-        .into_iter()
-        .map(|p| scrub_one(p, overwrite))
-        .collect()
+fn scrub_files(app: AppHandle, paths: Vec<String>, overwrite: bool) -> Vec<ScrubResult> {
+    CANCELLED.store(false, Ordering::SeqCst);
+    let expanded = expand_paths(paths);
+    let total = expanded.len();
+    let mut out = Vec::with_capacity(total);
+    for (i, p) in expanded.into_iter().enumerate() {
+        if CANCELLED.load(Ordering::SeqCst) {
+            break;
+        }
+        let name = file_name(&p);
+        tick(&app, "scrub", i, total, &name);
+        out.push(scrub_one(p, overwrite));
+    }
+    tick(&app, "done", total, total, "");
+    out
 }
 
 fn scrub_one(p: String, overwrite: bool) -> ScrubResult {
@@ -358,7 +433,7 @@ fn scrub_heic(p: String, path: &Path, name: String, original_bytes: usize) -> Sc
             original_bytes,
             cleaned_bytes: clean.len(),
             error: None,
-            note: Some("Converted HEIC → clean JPEG".to_string()),
+            note: Some("Converted HEIC to a clean JPEG".to_string()),
         },
         Err(e) => ScrubResult::failed(p, name, original_bytes, format!("Couldn't write output: {}", e)),
     }
@@ -374,7 +449,7 @@ fn scrub_video(p: String, path: &Path, name: String, overwrite: bool) -> ScrubRe
                 p,
                 name,
                 original_bytes,
-                "ffmpeg not found — run `brew install ffmpeg` to scrub video.".to_string(),
+                "ffmpeg not found. Run `brew install ffmpeg` to scrub video.".to_string(),
             )
         }
     };
@@ -492,7 +567,9 @@ pub fn run() {
             inspect_files,
             scrub_files,
             reveal_in_finder,
-            open_url
+            open_url,
+            capabilities,
+            cancel_batch
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

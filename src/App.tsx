@@ -1,97 +1,101 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import "./App.css";
-import scrubIcon from "./assets/scrub-icon.png";
 
-type ImageFormat = "jpeg" | "png" | "webp" | "heic" | "video";
+import "./styles/tokens.css";
+import "./styles/base.css";
+import "./styles/app.css";
 
-interface MetadataBlock {
-  label: string;
-  bytes: number;
-}
-interface ExifHighlights {
-  gps: string | null;
-  gpsMapsUrl: string | null;
-  camera: string | null;
-  dateTime: string | null;
-  software: string | null;
-  otherCount: number;
-}
-interface Inspection {
-  format: ImageFormat;
-  totalBytes: number;
-  metadataBytes: number;
-  blocks: MetadataBlock[];
-  highlights: ExifHighlights;
-  hasMetadata: boolean;
-  note: string | null;
-}
-interface FileInspection {
-  path: string;
-  name: string;
-  inspection: Inspection | null;
-  error: string | null;
-}
-interface ScrubResult {
-  path: string;
-  name: string;
-  outputPath: string | null;
-  outputName: string | null;
-  removed: MetadataBlock[];
-  bytesRemoved: number;
-  originalBytes: number;
-  cleanedBytes: number;
-  error: string | null;
-  note: string | null;
-}
-interface Entry {
-  path: string;
-  name: string;
-  inspection: Inspection | null;
-  error: string | null;
-  result?: ScrubResult;
-}
+import { TitleBar } from "./components/TitleBar";
+import { EmptyState } from "./components/EmptyState";
+import { DropOverlay } from "./components/DropOverlay";
+import { SummaryPanel, type Stats } from "./components/SummaryPanel";
+import { FileRow } from "./components/FileRow";
+import { ActionBar, type OutputMode } from "./components/ActionBar";
+import { Toast, type ToastData } from "./components/Toast";
+import { Spinner } from "./components/Icons";
 
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-}
+import { useTheme } from "./lib/theme";
+import { formatBytes, plural, riskOf } from "./lib/format";
+import type {
+  Capabilities,
+  Entry,
+  FileInspection,
+  Progress,
+  ScrubResult,
+} from "./lib/types";
 
-const VIDEO_EXT = ["MOV", "MP4", "M4V", "QT"];
-function ext(name: string): string {
-  const i = name.lastIndexOf(".");
-  return i >= 0 ? name.slice(i + 1).toUpperCase() : "";
-}
+const IMAGE_EXTS = ["jpg", "jpeg", "png", "webp", "heic", "heif"];
+const VIDEO_EXTS = ["mov", "mp4", "m4v", "qt"];
 
-function App() {
+type Phase = "idle" | "inspecting" | "scrubbing";
+
+export default function App() {
   const [entries, setEntries] = useState<Entry[]>([]);
   const [dragging, setDragging] = useState(false);
-  const [overwrite, setOverwrite] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [mode, setMode] = useState<OutputMode>("copy");
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [progress, setProgress] = useState<Progress | null>(null);
+  const [caps, setCaps] = useState<Capabilities>({ ffmpeg: true, sips: true });
+  const [toast, setToast] = useState<ToastData | null>(null);
+  /** Drives the hairline under the title bar: only once content is behind it. */
+  const [scrolled, setScrolled] = useState(false);
+
+  const theme = useTheme();
+  const busy = phase !== "idle";
+  /** Paths handed to the current scrub, so a progress index maps to a row. */
+  const batch = useRef<string[]>([]);
+
+  // -- backend wiring ------------------------------------------------------
+
+  useEffect(() => {
+    invoke<Capabilities>("capabilities").then(setCaps).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const p = listen<Progress>("scrub://progress", (e) => setProgress(e.payload));
+    return () => {
+      void p.then((un) => un());
+    };
+  }, []);
 
   const addPaths = useCallback(async (paths: string[]) => {
     if (!paths.length) return;
-    setBusy(true);
+    setPhase("inspecting");
+    setProgress(null);
     try {
       const results = await invoke<FileInspection[]>("inspect_files", { paths });
       setEntries((prev) => {
+        // Keyed by path so re-dropping a file refreshes it instead of duplicating.
         const byPath = new Map(prev.map((e) => [e.path, e]));
         for (const r of results) {
-          byPath.set(r.path, { path: r.path, name: r.name, inspection: r.inspection, error: r.error });
+          byPath.set(r.path, {
+            path: r.path,
+            name: r.name,
+            inspection: r.inspection,
+            error: r.error,
+          });
         }
-        return Array.from(byPath.values());
+        return [...byPath.values()];
+      });
+    } catch (err) {
+      setToast({
+        id: Date.now(),
+        tone: "error",
+        title: "Couldn't read those files",
+        detail: String(err),
       });
     } finally {
-      setBusy(false);
+      setPhase("idle");
+      setProgress(null);
     }
   }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    getCurrentWebview()
+    void getCurrentWebview()
       .onDragDropEvent((event) => {
         if (event.payload.type === "enter" || event.payload.type === "over") {
           setDragging(true);
@@ -108,195 +112,244 @@ function App() {
     return () => unlisten?.();
   }, [addPaths]);
 
-  const browse = useCallback(async () => {
-    const selected = await open({
+  // -- actions -------------------------------------------------------------
+
+  const browseFiles = useCallback(async () => {
+    const picked = await open({
       multiple: true,
-      filters: [
-        { name: "Media", extensions: ["jpg", "jpeg", "png", "webp", "heic", "heif", "mov", "mp4", "m4v", "qt"] },
-      ],
+      filters: [{ name: "Images & video", extensions: [...IMAGE_EXTS, ...VIDEO_EXTS] }],
     });
-    if (!selected) return;
-    void addPaths(Array.isArray(selected) ? selected : [selected]);
+    if (!picked) return;
+    void addPaths(Array.isArray(picked) ? picked : [picked]);
+  }, [addPaths]);
+
+  const browseFolder = useCallback(async () => {
+    const picked = await open({ directory: true, multiple: false });
+    if (!picked) return;
+    void addPaths([picked as string]);
   }, [addPaths]);
 
   const scrubbable = useMemo(
     () => entries.filter((e) => e.inspection?.hasMetadata && !e.result),
-    [entries]
+    [entries],
   );
 
   const scrub = useCallback(async () => {
     const paths = scrubbable.map((e) => e.path);
     if (!paths.length) return;
-    setBusy(true);
+    batch.current = paths;
+    setPhase("scrubbing");
+    setProgress({ phase: "scrub", index: 0, total: paths.length, name: "" });
     try {
-      const results = await invoke<ScrubResult[]>("scrub_files", { paths, overwrite });
+      const results = await invoke<ScrubResult[]>("scrub_files", {
+        paths,
+        overwrite: mode === "overwrite",
+      });
       setEntries((prev) => {
         const byPath = new Map(prev.map((e) => [e.path, e]));
         for (const r of results) {
           const existing = byPath.get(r.path);
           if (existing) byPath.set(r.path, { ...existing, result: r });
         }
-        return Array.from(byPath.values());
+        return [...byPath.values()];
       });
+
+      const ok = results.filter((r) => !r.error);
+      const failed = results.length - ok.length;
+      const removed = ok.reduce((n, r) => n + r.bytesRemoved, 0);
+      const firstOut = ok.find((r) => r.outputPath)?.outputPath;
+
+      setToast({
+        id: Date.now(),
+        tone: failed ? "error" : "ok",
+        title: failed
+          ? `${failed} of ${results.length} ${plural(results.length, "file")} failed`
+          : `Scrubbed ${ok.length} ${plural(ok.length, "file")}`,
+        detail: failed
+          ? "Open the list to see what went wrong."
+          : removed > 0
+            ? `${formatBytes(removed, true)} of metadata removed · pixels untouched`
+            : "Metadata removed · pixels untouched",
+        action: firstOut
+          ? { label: "Show", run: () => void invoke("reveal_in_finder", { path: firstOut }) }
+          : undefined,
+      });
+    } catch (err) {
+      setToast({ id: Date.now(), tone: "error", title: "Scrub failed", detail: String(err) });
     } finally {
-      setBusy(false);
+      setPhase("idle");
+      setProgress(null);
+      batch.current = [];
     }
-  }, [scrubbable, overwrite]);
+  }, [scrubbable, mode]);
+
+  const cancel = useCallback(() => {
+    void invoke("cancel_batch").catch(() => {});
+  }, []);
 
   const reveal = useCallback((path: string) => {
     void invoke("reveal_in_finder", { path }).catch(() => {});
   }, []);
 
-  const onMap = useCallback((url: string) => {
+  const openMap = useCallback((url: string) => {
     void invoke("open_url", { url }).catch(() => {});
   }, []);
 
-  const totalToRemove = scrubbable.reduce((sum, e) => sum + (e.inspection?.metadataBytes ?? 0), 0);
+  const removeEntry = useCallback((path: string) => {
+    setEntries((prev) => prev.filter((e) => e.path !== path));
+  }, []);
 
-  return (
-    <main className="app">
-      <header className="header">
-        <div className="brand">
-          <img src={scrubIcon} className="logo" alt="Scrub icon" />
-          <div className="brand-text">
-            <h1>Scrub</h1>
-            <p>Strip hidden metadata from images — locally &amp; losslessly.</p>
-          </div>
-        </div>
-        {entries.length > 0 && (
-          <button className="ghost" onClick={() => setEntries([])}>
-            Clear
-          </button>
-        )}
-      </header>
+  const clear = useCallback(() => {
+    setEntries([]);
+    setToast(null);
+  }, []);
 
-      <section className={`dropzone ${dragging ? "dragging" : ""} ${entries.length ? "compact" : ""}`}>
-        <div className="dropzone-inner">
-          <p className="dz-title">{dragging ? "Drop to add" : "Drop images or a folder here"}</p>
-          <p className="dz-sub">JPEG · PNG · WebP · HEIC · MP4 · MOV · or</p>
-          <button className="primary" onClick={browse} disabled={busy}>
-            Browse…
-          </button>
-        </div>
-      </section>
+  const revealAll = useCallback(() => {
+    const out = entries.find((e) => e.result?.outputPath)?.result?.outputPath;
+    if (out) reveal(out);
+  }, [entries, reveal]);
 
-      <section className="list">
-        {entries.map((e) => (
-          <FileCard key={e.path} entry={e} onReveal={reveal} onMap={onMap} />
-        ))}
-      </section>
+  // -- keyboard ------------------------------------------------------------
 
-      {scrubbable.length > 0 && (
-        <footer className="actionbar">
-          <label className="overwrite">
-            <input type="checkbox" checked={overwrite} onChange={(ev) => setOverwrite(ev.target.checked)} />
-            Overwrite originals
-          </label>
-          <span className="spacer" />
-          <span className="hint">
-            {scrubbable.length} image{scrubbable.length > 1 ? "s" : ""}
-            {totalToRemove > 0 ? ` · ${formatBytes(totalToRemove)} of metadata` : ""}
-          </span>
-          <button className="primary scrub" onClick={scrub} disabled={busy}>
-            {busy ? "Scrubbing…" : overwrite ? "Scrub & overwrite" : "Scrub → copies"}
-          </button>
-        </footer>
-      )}
-    </main>
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const cmd = e.metaKey || e.ctrlKey;
+      if (cmd && e.key.toLowerCase() === "o") {
+        e.preventDefault();
+        void (e.shiftKey ? browseFolder() : browseFiles());
+      } else if (cmd && e.key === "Enter") {
+        e.preventDefault();
+        if (!busy) void scrub();
+      } else if (cmd && (e.key === "Backspace" || e.key === "Delete")) {
+        e.preventDefault();
+        if (!busy) clear();
+      } else if (e.key === "Escape" && phase === "scrubbing") {
+        e.preventDefault();
+        cancel();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [browseFiles, browseFolder, scrub, clear, cancel, busy, phase]);
+
+  // -- derived -------------------------------------------------------------
+
+  const stats: Stats = useMemo(() => {
+    const s: Stats = {
+      total: entries.length,
+      exposed: 0,
+      traces: 0,
+      clean: 0,
+      errors: 0,
+      metadataBytes: 0,
+      withLocation: 0,
+      withDevice: 0,
+      withTime: 0,
+      scrubbed: 0,
+      bytesRemoved: 0,
+    };
+    for (const e of entries) {
+      const risk = riskOf(e);
+      if (risk === "exposed") s.exposed++;
+      else if (risk === "traces") s.traces++;
+      else if (risk === "clean") s.clean++;
+      else s.errors++;
+
+      const h = e.inspection?.highlights;
+      if (h?.gps) s.withLocation++;
+      if (h?.camera) s.withDevice++;
+      if (h?.dateTime) s.withTime++;
+      if (!e.result) s.metadataBytes += e.inspection?.metadataBytes ?? 0;
+      if (e.result && !e.result.error) {
+        s.scrubbed++;
+        s.bytesRemoved += e.result.bytesRemoved;
+      }
+    }
+    return s;
+  }, [entries]);
+
+  const pendingBytes = scrubbable.reduce(
+    (n, e) => n + (e.inspection?.metadataBytes ?? 0),
+    0,
   );
-}
-
-function FileCard({
-  entry,
-  onReveal,
-  onMap,
-}: {
-  entry: Entry;
-  onReveal: (p: string) => void;
-  onMap: (url: string) => void;
-}) {
-  const { inspection, error, result } = entry;
-  const h = inspection?.highlights;
-  const isVideo = inspection?.format === "video" || VIDEO_EXT.includes(ext(entry.name));
+  const allDone = entries.length > 0 && scrubbable.length === 0 && stats.scrubbed > 0;
+  const activePath =
+    phase === "scrubbing" && progress ? (batch.current[progress.index] ?? null) : null;
+  const ratio =
+    progress && progress.total > 0 ? Math.min(1, progress.index / progress.total) : null;
 
   return (
-    <div className="card">
-      {isVideo ? (
-        <video className="thumb" src={convertFileSrc(entry.path)} muted preload="metadata" />
-      ) : (
-        <img className="thumb" src={convertFileSrc(entry.path)} alt="" />
-      )}
-      <div className="card-body">
-        <div className="card-head">
-          <span className="fname" title={entry.path}>
-            {entry.name}
-          </span>
-          {inspection && (
-            <span className="badge">
-              {inspection.format === "video" ? ext(entry.name) : inspection.format.toUpperCase()} ·{" "}
-              {formatBytes(inspection.totalBytes)}
-            </span>
-          )}
-        </div>
+    <div className="shell" data-scrolled={scrolled}>
+      <TitleBar
+        theme={theme.choice}
+        onCycleTheme={theme.cycle}
+        count={entries.length}
+        onClear={clear}
+      />
 
-        {error && <div className="error">⚠ {error}</div>}
-
-        {inspection && !result && (
-          inspection.hasMetadata ? (
-            <div className="meta">
-              {h?.gps && (
-                <button
-                  className="gps"
-                  title="Open this location in Maps"
-                  onClick={() => h.gpsMapsUrl && onMap(h.gpsMapsUrl)}
-                >
-                  📍 Location embedded: <strong>{h.gps}</strong>{" "}
-                  <span className="gps-open">— open in Maps ↗</span>
-                </button>
+      <main
+        className="content scroll"
+        onScroll={(e) => setScrolled(e.currentTarget.scrollTop > 4)}
+      >
+        {entries.length === 0 ? (
+          phase === "inspecting" ? (
+            <div className="scanning pop">
+              <Spinner size={22} />
+              <p className="scanning__title shimmer">
+                Reading {progress?.name || "files"}…
+              </p>
+              {progress && progress.total > 1 && (
+                <p className="scanning__count mono">
+                  {progress.index + 1} of {progress.total}
+                </p>
               )}
-              {(h?.camera || h?.dateTime || h?.software) && (
-                <div className="chips">
-                  {h?.camera && <span className="chip">📷 {h.camera}</span>}
-                  {h?.dateTime && <span className="chip">🕑 {h.dateTime}</span>}
-                  {h?.software && <span className="chip">🛠 {h.software}</span>}
-                </div>
-              )}
-              {inspection.blocks.length > 0 && (
-                <div className="blocks">
-                  {inspection.blocks.map((b, i) => (
-                    <span className="block" key={i}>
-                      {b.label} <em>{formatBytes(b.bytes)}</em>
-                    </span>
-                  ))}
-                </div>
-              )}
-              {inspection.note && <div className="note">{inspection.note}</div>}
             </div>
           ) : (
-            <div className="clean">✓ No metadata found — already clean.</div>
+            <EmptyState
+              onBrowseFiles={browseFiles}
+              onBrowseFolder={browseFolder}
+              busy={busy}
+              ffmpegMissing={!caps.ffmpeg}
+            />
           )
+        ) : (
+          <div className="stack">
+            <SummaryPanel stats={stats} allDone={allDone} onRevealAll={revealAll} />
+            <ul className="rows">
+              {entries.map((e, i) => (
+                <FileRow
+                  key={e.path}
+                  entry={e}
+                  index={i}
+                  active={e.path === activePath}
+                  onReveal={reveal}
+                  onMap={openMap}
+                  onRemove={removeEntry}
+                />
+              ))}
+            </ul>
+          </div>
         )}
+      </main>
 
-        {result &&
-          (result.error ? (
-            <div className="error">⚠ {result.error}</div>
-          ) : result.outputName ? (
-            <div className="done">
-              <span className="done-line">
-                ✓ {result.note ?? `Scrubbed · removed ${formatBytes(result.bytesRemoved)}`} → {result.outputName}
-              </span>
-              {result.outputPath && (
-                <button className="ghost sm" onClick={() => onReveal(result.outputPath!)}>
-                  Show in Finder
-                </button>
-              )}
-            </div>
-          ) : (
-            <div className="clean">✓ Already clean — nothing to remove.</div>
-          ))}
-      </div>
+      {entries.length > 0 && (
+        <ActionBar
+          mode={mode}
+          onModeChange={setMode}
+          count={scrubbable.length}
+          bytes={pendingBytes}
+          busy={busy}
+          phase={phase}
+          progress={ratio}
+          allDone={allDone}
+          onScrub={scrub}
+          onCancel={cancel}
+          onAdd={browseFiles}
+        />
+      )}
+
+      <DropOverlay show={dragging} />
+      <Toast toast={toast} onDismiss={() => setToast(null)} />
     </div>
   );
 }
-
-export default App;

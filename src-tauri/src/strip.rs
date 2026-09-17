@@ -48,6 +48,9 @@ pub struct Inspection {
     pub highlights: ExifHighlights,
     pub has_metadata: bool,
     pub note: Option<String>,
+    /// Pixel dimensions, when we can read them from the container cheaply.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 pub fn detect_format(data: &[u8]) -> Option<ImageFormat> {
@@ -75,7 +78,7 @@ fn is_heic_brand(brand: &[u8]) -> bool {
 /// Inspect bytes: report format, metadata blocks present, and EXIF highlights.
 pub fn inspect(data: &[u8]) -> Result<Inspection, String> {
     let format = detect_format(data).ok_or_else(|| {
-        "Unsupported file type — Scrub handles JPEG, PNG, WebP and HEIC.".to_string()
+        "Unsupported file type. Scrub handles JPEG, PNG, WebP and HEIC.".to_string()
     })?;
 
     // HEIC can't be stripped in place; it's converted to a clean JPEG when scrubbed.
@@ -87,12 +90,18 @@ pub fn inspect(data: &[u8]) -> Result<Inspection, String> {
             blocks: Vec::new(),
             highlights: exif_highlights(data),
             has_metadata: true,
-            note: Some("HEIC — scrubs to a clean JPEG copy".to_string()),
+            note: Some("HEIC converts to a clean JPEG copy".to_string()),
+            width: None,
+            height: None,
         });
     }
 
     let (_, blocks) = walk(format, data)?;
     let metadata_bytes = blocks.iter().map(|b| b.bytes).sum();
+    let (width, height) = match dimensions(data, format) {
+        Some((w, h)) => (Some(w), Some(h)),
+        None => (None, None),
+    };
     Ok(Inspection {
         format,
         total_bytes: data.len(),
@@ -101,13 +110,127 @@ pub fn inspect(data: &[u8]) -> Result<Inspection, String> {
         blocks,
         highlights: exif_highlights(data),
         note: None,
+        width,
+        height,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Pixel dimensions
+// ---------------------------------------------------------------------------
+
+/// Read pixel dimensions straight out of the container header. Best-effort:
+/// anything malformed or unrecognised returns `None` rather than erroring, so
+/// a missing size never blocks an inspection.
+pub fn dimensions(data: &[u8], format: ImageFormat) -> Option<(u32, u32)> {
+    match format {
+        ImageFormat::Png => png_dimensions(data),
+        ImageFormat::Jpeg => jpeg_dimensions(data),
+        ImageFormat::Webp => webp_dimensions(data),
+        _ => None,
+    }
+}
+
+fn be32(b: &[u8]) -> u32 {
+    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// IHDR is mandated to be the first chunk, so width/height sit at a fixed offset.
+fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    if data.len() < 24 || &data[12..16] != b"IHDR" {
+        return None;
+    }
+    Some((be32(&data[16..20]), be32(&data[20..24])))
+}
+
+/// Walk the marker segments to the first Start-of-Frame, which carries the size.
+fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 2usize; // past SOI
+    while i + 3 < data.len() {
+        if data[i] != 0xFF {
+            return None;
+        }
+        let mut m = i;
+        while m < data.len() && data[m] == 0xFF {
+            m += 1;
+        }
+        let marker = *data.get(m)?;
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            i = m + 1;
+            continue;
+        }
+        if marker == 0xDA || marker == 0xD9 {
+            return None; // reached image data without a SOF
+        }
+        let len_pos = m + 1;
+        if len_pos + 1 >= data.len() {
+            return None;
+        }
+        let seg_len = ((data[len_pos] as usize) << 8) | (data[len_pos + 1] as usize);
+        // SOF0..SOF15 hold the frame header; DHT/JPG/DAC share the range but aren't frames.
+        let is_sof = (0xC0..=0xCF).contains(&marker)
+            && marker != 0xC4
+            && marker != 0xC8
+            && marker != 0xCC;
+        if is_sof {
+            let p = len_pos + 2;
+            if p + 5 > data.len() {
+                return None;
+            }
+            let h = ((data[p + 1] as u32) << 8) | data[p + 2] as u32;
+            let w = ((data[p + 3] as u32) << 8) | data[p + 4] as u32;
+            return Some((w, h));
+        }
+        if seg_len < 2 {
+            return None;
+        }
+        i = len_pos + seg_len;
+    }
+    None
+}
+
+/// WebP stores size in whichever of VP8X / VP8 / VP8L opens the RIFF payload.
+fn webp_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    if data.len() < 21 {
+        return None;
+    }
+    let kind = &data[12..16];
+    let p = &data[20..];
+    match kind {
+        // Extended format: canvas size as two 24-bit little-endian (value - 1).
+        b"VP8X" => {
+            if p.len() < 10 {
+                return None;
+            }
+            let w = (p[4] as u32) | ((p[5] as u32) << 8) | ((p[6] as u32) << 16);
+            let h = (p[7] as u32) | ((p[8] as u32) << 8) | ((p[9] as u32) << 16);
+            Some((w + 1, h + 1))
+        }
+        // Lossy: 3-byte start code, then 14-bit width and height.
+        b"VP8 " => {
+            if p.len() < 10 || p[3] != 0x9D || p[4] != 0x01 || p[5] != 0x2A {
+                return None;
+            }
+            let w = (((p[7] as u32) << 8) | p[6] as u32) & 0x3FFF;
+            let h = (((p[9] as u32) << 8) | p[8] as u32) & 0x3FFF;
+            Some((w, h))
+        }
+        // Lossless: signature byte, then 14 bits width-1 and 14 bits height-1.
+        b"VP8L" => {
+            if p.len() < 5 || p[0] != 0x2F {
+                return None;
+            }
+            let bits = u32::from_le_bytes([p[1], p[2], p[3], p[4]]);
+            Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1))
+        }
+        _ => None,
+    }
 }
 
 /// Strip bytes: return cleaned image + the blocks that were removed.
 pub fn strip(data: &[u8]) -> Result<(Vec<u8>, Vec<MetadataBlock>, ImageFormat), String> {
     let format = detect_format(data).ok_or_else(|| {
-        "Unsupported file type — Scrub handles JPEG, PNG, WebP and HEIC.".to_string()
+        "Unsupported file type. Scrub handles JPEG, PNG, WebP and HEIC.".to_string()
     })?;
     let (out, blocks) = walk(format, data)?;
     Ok((out, blocks, format))
@@ -490,6 +613,74 @@ mod tests {
         png_chunk(&mut d, b"IDAT", &[0x08, 0x1D]);
         png_chunk(&mut d, b"IEND", &[]);
         d
+    }
+
+    /// JPEG with a real SOF0 so the dimension walk has a frame header to find.
+    fn sample_jpeg_with_sof(w: u16, h: u16) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&[0xFF, 0xD8]);
+        // APP1 EXIF ahead of the frame: the walk has to skip it, not stop at it.
+        d.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x0C]);
+        d.extend_from_slice(b"Exif\x00\x00");
+        d.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        // SOF0: length, precision, height, width, one component.
+        d.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08]);
+        d.extend_from_slice(&h.to_be_bytes());
+        d.extend_from_slice(&w.to_be_bytes());
+        d.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+        d.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x3F, 0x00, 0x00]);
+        d.extend_from_slice(&[0xFF, 0xD9]);
+        d
+    }
+
+    fn webp(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(b"RIFF");
+        d.extend_from_slice(&((payload.len() + 12) as u32).to_le_bytes());
+        d.extend_from_slice(b"WEBP");
+        d.extend_from_slice(kind);
+        d.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        d.extend_from_slice(payload);
+        d
+    }
+
+    #[test]
+    fn reads_png_dimensions() {
+        // sample_png()'s IHDR declares 1x1.
+        assert_eq!(dimensions(&sample_png(), ImageFormat::Png), Some((1, 1)));
+        assert_eq!(dimensions(&[0x89, 0x50], ImageFormat::Png), None);
+    }
+
+    #[test]
+    fn reads_jpeg_dimensions() {
+        let d = sample_jpeg_with_sof(4032, 3024);
+        assert_eq!(dimensions(&d, ImageFormat::Jpeg), Some((4032, 3024)));
+        // No frame header at all: report nothing rather than a guess.
+        assert_eq!(dimensions(&sample_jpeg(), ImageFormat::Jpeg), None);
+    }
+
+    #[test]
+    fn reads_webp_dimensions() {
+        // VP8X stores canvas size as (value - 1) in 24-bit little-endian.
+        let mut x = vec![0x10, 0, 0, 0];
+        x.extend_from_slice(&[0xE7, 0x03, 0x00]); // 999 -> 1000
+        x.extend_from_slice(&[0xE5, 0x02, 0x00]); // 741 -> 742
+        assert_eq!(dimensions(&webp(b"VP8X", &x), ImageFormat::Webp), Some((1000, 742)));
+
+        // Lossy: 3-byte frame tag, start code, then 14-bit width and height.
+        let mut lossy = vec![0x00, 0x00, 0x00, 0x9D, 0x01, 0x2A];
+        lossy.extend_from_slice(&320u16.to_le_bytes());
+        lossy.extend_from_slice(&240u16.to_le_bytes());
+        assert_eq!(dimensions(&webp(b"VP8 ", &lossy), ImageFormat::Webp), Some((320, 240)));
+
+        // Lossless: signature byte, then 14 bits width-1 and 14 bits height-1.
+        let bits: u32 = (63) | (47 << 14);
+        let mut ll = vec![0x2F];
+        ll.extend_from_slice(&bits.to_le_bytes());
+        assert_eq!(dimensions(&webp(b"VP8L", &ll), ImageFormat::Webp), Some((64, 48)));
+
+        // An unknown opening chunk isn't an error, just an unknown size.
+        assert_eq!(dimensions(&webp(b"ALPH", &[0; 12]), ImageFormat::Webp), None);
     }
 
     #[test]
